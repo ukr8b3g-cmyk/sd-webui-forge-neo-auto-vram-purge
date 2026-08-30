@@ -64,11 +64,19 @@ v1.1 adds:
 - Diagnostic logging shows cleanup duration, garbage-collected object count, CUDA free memory, and allocator-reserved memory before/after cleanup.
 - Cleanup errors are logged and never turn an otherwise successful generation into a failed job.
 
-Example log:
+v1.1.1 also registers the extension logger through Forge Neo's native logging setup. On startup you should see:
+
+```text
+Forge Neo Auto VRAM Purge v1.1.1 loaded
+```
+
+After a generation with `Cache Only` or `Unload GPU Models`, you should see a completion line such as:
 
 ```text
 Auto VRAM Purge completed: Cache Only | 0.084s | GC=31 | CUDA free 4210 -> 4375 MiB (+165 MiB) | reserved 1080 -> 915 MiB
 ```
+
+If the startup line appears but the completion line does not, the generation lifecycle hook did not run and should be investigated separately. `OFF` intentionally produces no completion line.
 
 ## Compatibility
 
@@ -76,4 +84,4 @@ Designed for Forge Neo. Other A1111/Forge forks are not guaranteed to expose the
 
 ## Version
 
-v1.1.0
+v1.1.1
