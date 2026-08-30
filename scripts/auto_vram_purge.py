@@ -9,6 +9,13 @@ import torch
 from modules import script_callbacks, scripts, shared
 
 logger = logging.getLogger("forge_neo_auto_vram_purge")
+try:
+    from backend.logging import setup_logger
+
+    setup_logger(logger)
+except Exception:
+    # Keep the extension usable on compatible forks without Forge Neo's logger helper.
+    logger.setLevel(logging.INFO)
 
 MODE_OFF = "OFF"
 MODE_CACHE_ONLY = "Cache Only"
@@ -16,6 +23,7 @@ MODE_UNLOAD_GPU = "Unload GPU Models"
 DEFAULT_MODE = MODE_CACHE_ONLY
 VALID_MODES = {MODE_OFF, MODE_CACHE_ONLY, MODE_UNLOAD_GPU}
 OPTION_KEY = "forge_neo_auto_vram_purge_mode"
+VERSION = "1.1.1"
 
 _purge_lock = threading.RLock()
 
@@ -183,6 +191,7 @@ def on_ui_settings():
 
 
 script_callbacks.on_ui_settings(on_ui_settings)
+logger.info("Forge Neo Auto VRAM Purge v%s loaded", VERSION)
 
 
 class AutoVRAMPurgeScript(scripts.Script):
