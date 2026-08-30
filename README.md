@@ -1,4 +1,6 @@
 # Forge Neo Auto VRAM Purge
+<img width="299" height="170" alt="{CF43CBAA-6A3C-4286-8335-296344AF214E}" src="https://github.com/user-attachments/assets/4ec31864-5ddc-4685-a228-f5dc99d65492" />
+
 
 A small Forge Neo extension that automatically cleans GPU memory after a generation job finishes.
 
