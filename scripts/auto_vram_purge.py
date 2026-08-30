@@ -20,10 +20,10 @@ except Exception:
 MODE_OFF = "OFF"
 MODE_CACHE_ONLY = "Cache Only"
 MODE_UNLOAD_GPU = "Unload GPU Models"
-DEFAULT_MODE = MODE_CACHE_ONLY
+DEFAULT_MODE = MODE_UNLOAD_GPU
 VALID_MODES = {MODE_OFF, MODE_CACHE_ONLY, MODE_UNLOAD_GPU}
 OPTION_KEY = "forge_neo_auto_vram_purge_mode"
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 _purge_lock = threading.RLock()
 
