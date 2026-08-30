@@ -23,7 +23,7 @@ MODE_UNLOAD_GPU = "Unload GPU Models"
 DEFAULT_MODE = MODE_UNLOAD_GPU
 VALID_MODES = {MODE_OFF, MODE_CACHE_ONLY, MODE_UNLOAD_GPU}
 OPTION_KEY = "forge_neo_auto_vram_purge_mode"
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 _purge_lock = threading.RLock()
 
@@ -160,23 +160,28 @@ def purge_memory(mode):
         collected = None
 
         if mode == MODE_UNLOAD_GPU:
+            unload_ok = False
             unload_all_models = getattr(memory_management, "unload_all_models", None) if memory_management else None
+
             if callable(unload_all_models):
                 try:
                     unload_all_models()
+                    unload_ok = True
                 except Exception:
-                    # Continue with GC/cache cleanup even if model offload fails.
                     logger.exception("Failed to unload Forge-managed GPU models")
             else:
                 logger.warning(
-                    "Forge Neo unload_all_models() is unavailable; falling back to cache cleanup only"
+                    "Forge Neo unload_all_models() is unavailable; falling back to GC and cache cleanup"
                 )
 
-            # Full GC is intentionally reserved for the strong cleanup mode.
-            collected = gc.collect()
+            # Forge Neo's successful unload path already performs its own model bookkeeping
+            # and allocator cleanup. Avoid a second full Python GC on the normal path.
+            # Retain full GC only as a safety fallback if host-model unloading is unavailable/fails.
+            if not unload_ok:
+                collected = gc.collect()
 
-        # Cache Only is intentionally lightweight: do not run a full Python GC.
-        # Forge Neo's allocator cleanup is enough to release already-unreferenced cache blocks.
+        # Both modes finish with Forge Neo's forced allocator cleanup. Cache Only intentionally
+        # skips full Python GC; Unload GPU Models also skips it after a successful host unload.
         _empty_accelerator_cache(memory_management)
 
         after = _cuda_memory_snapshot()
