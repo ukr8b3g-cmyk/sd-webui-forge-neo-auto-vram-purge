@@ -23,7 +23,7 @@ MODE_UNLOAD_GPU = "Unload GPU Models"
 DEFAULT_MODE = MODE_UNLOAD_GPU
 VALID_MODES = {MODE_OFF, MODE_CACHE_ONLY, MODE_UNLOAD_GPU}
 OPTION_KEY = "forge_neo_auto_vram_purge_mode"
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 _purge_lock = threading.RLock()
 
@@ -120,14 +120,16 @@ def _format_mib(value):
 
 
 def _log_result(mode, elapsed, before, after, collected):
+    gc_result = "skipped" if collected is None else str(collected)
+
     if before and after:
         freed = after["free"] - before["free"]
         logger.info(
-            "Auto VRAM Purge completed: %s | %.3fs | GC=%d | "
+            "Auto VRAM Purge completed: %s | %.3fs | GC=%s | "
             "CUDA free %.0f -> %.0f MiB (%+.0f MiB) | reserved %.0f -> %.0f MiB",
             mode,
             elapsed,
-            collected,
+            gc_result,
             _format_mib(before["free"]),
             _format_mib(after["free"]),
             _format_mib(freed),
@@ -136,10 +138,10 @@ def _log_result(mode, elapsed, before, after, collected):
         )
     else:
         logger.info(
-            "Auto VRAM Purge completed: %s | %.3fs | GC=%d",
+            "Auto VRAM Purge completed: %s | %.3fs | GC=%s",
             mode,
             elapsed,
-            collected,
+            gc_result,
         )
 
 
@@ -155,6 +157,7 @@ def purge_memory(mode):
         start = time.perf_counter()
         before = _cuda_memory_snapshot()
         memory_management = _get_forge_memory_manager()
+        collected = None
 
         if mode == MODE_UNLOAD_GPU:
             unload_all_models = getattr(memory_management, "unload_all_models", None) if memory_management else None
@@ -169,7 +172,11 @@ def purge_memory(mode):
                     "Forge Neo unload_all_models() is unavailable; falling back to cache cleanup only"
                 )
 
-        collected = gc.collect()
+            # Full GC is intentionally reserved for the strong cleanup mode.
+            collected = gc.collect()
+
+        # Cache Only is intentionally lightweight: do not run a full Python GC.
+        # Forge Neo's allocator cleanup is enough to release already-unreferenced cache blocks.
         _empty_accelerator_cache(memory_management)
 
         after = _cuda_memory_snapshot()
