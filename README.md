@@ -92,21 +92,45 @@ Representative runs:
 
 The stable unload runs were around **0.39–0.40 seconds**, with the first heavier run taking 0.734 seconds. Observed next KModel moves were about **0.96–1.09 seconds**.
 
-Total generation progress in the shown test was roughly **10 seconds with Cache Only** and **11 seconds with Unload GPU Models**, so the practical end-to-end difference remained small relative to generation time.
+### Unload GPU Models — v1.2.2 optimized
 
-### v1.2.2 unload optimization
+From v1.2.2, a successful Forge Neo `unload_all_models()` path skips the extension's second full `gc.collect()`. Forge Neo already performs model bookkeeping and memory cleanup during its unload path, so the extra full Python GC was redundant in the tested setup.
 
-From v1.2.2, a successful Forge Neo `unload_all_models()` path skips the extension's second full `gc.collect()`. Forge Neo already performs model bookkeeping and memory cleanup during its unload path, so the extra full Python GC appeared redundant.
+Measured v1.2.2 runs:
 
-The normal v1.2.2 unload sequence is now:
+| Purge time | CUDA free before → after | VRAM released | Reserved before → after | GC |
+|---:|---:|---:|---:|---:|
+| 0.468 s | 9282 → 14914 MiB | +5632 MiB | 5824 → 192 MiB | skipped |
+| 0.139 s | 11042 → 14850 MiB | +3808 MiB | 4064 → 256 MiB | skipped |
+| 0.123 s | 11034 → 14842 MiB | +3808 MiB | 4064 → 256 MiB | skipped |
+| 0.133 s | 11034 → 14810 MiB | +3776 MiB | 4064 → 288 MiB | skipped |
+| 0.118 s | 11034 → 14810 MiB | +3776 MiB | 4064 → 288 MiB | skipped |
 
-1. Forge Neo `backend.memory_management.unload_all_models()`.
-2. Skip extension-level full Python GC when unload succeeds.
-3. Forge Neo forced allocator cleanup.
+The first run again had a heavier initial-state cleanup. Excluding that first run, the four stable runs were:
 
-If Forge's unload function is unavailable or throws an error, the extension falls back to full Python GC before allocator cleanup. This preserves a stronger recovery path for abnormal cases.
+- **0.139 s**
+- **0.123 s**
+- **0.133 s**
+- **0.118 s**
 
-The v1.2.2 unload timing and VRAM-release figures should be re-measured after updating; the v1.2.1 numbers above remain the baseline for comparison.
+Stable average: **~0.128 seconds**.
+
+Compared with the v1.2.1 stable baseline of roughly **0.397 seconds**, the normal unload cleanup path became approximately **68% faster**, while preserving essentially the same steady-state VRAM release of about **3.8 GiB**.
+
+Observed next KModel moves remained about **0.93–1.08 seconds**, so skipping the redundant extension-level GC did not create a noticeable model-transfer penalty in this test.
+
+In the shown v1.2.2 runs, total generation progress was around **10 seconds**, including the optimized unload cleanup. This makes the cleanup itself a small fraction of total generation time on this system.
+
+### Summary of measured optimization
+
+| Mode / version | Typical cleanup time | Observed VRAM release |
+|---|---:|---:|
+| Cache Only, pre-v1.2.1 | ~0.277 s average | 0 MiB |
+| Cache Only, v1.2.1+ | ~0.000–0.001 s | 0 MiB |
+| Unload GPU Models, v1.2.1 stable | ~0.397 s | ~3.8 GiB |
+| Unload GPU Models, v1.2.2 stable | **~0.128 s** | **~3.8 GiB** |
+
+These results support the current design: **Cache Only is effectively zero-overhead but may release nothing extra, while Unload GPU Models returns several GiB of VRAM with only a small cleanup-time cost on the tested system.**
 
 ## Design
 
@@ -154,10 +178,10 @@ After a generation with `Cache Only` or a successful `Unload GPU Models`, the co
 Auto VRAM Purge completed: Cache Only | 0.001s | GC=skipped | CUDA free ...
 ```
 
-Successful v1.2.2 unload example format:
+Successful v1.2.2 unload example:
 
 ```text
-Auto VRAM Purge completed: Unload GPU Models | 0.xxxs | GC=skipped | CUDA free ...
+Auto VRAM Purge completed: Unload GPU Models | 0.123s | GC=skipped | CUDA free 11034 -> 14842 MiB (+3808 MiB) | reserved 4064 -> 256 MiB
 ```
 
 If host unloading fails, the log will instead show the number of objects collected by the fallback GC.
