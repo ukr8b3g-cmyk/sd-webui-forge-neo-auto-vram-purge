@@ -23,17 +23,18 @@ DEFAULT_MODE = MODE_UNLOAD_GPU
 VALID_MODES = {MODE_FORGE_DEFAULT, MODE_UNLOAD_GPU}
 LEGACY_FORGE_DEFAULT_MODES = {"OFF", "Cache Only"}
 OPTION_KEY = "forge_neo_auto_vram_purge_mode"
-VERSION = "1.2.4"
+VERSION = "1.2.5"
 
-# Forge Neo's Generate forever loop checks for the next generation every 500 ms.
-# A short grace period keeps models resident across continuous generations while
-# still returning VRAM shortly after a normal one-shot generation becomes idle.
-IDLE_UNLOAD_DELAY_SECONDS = 1.5
+# Generate forever polls every 500 ms, but the browser can only request the next
+# job after the previous Gradio response/UI update has completed. Start this grace
+# period after the current Forge queue job is actually idle, not from postprocess().
+IDLE_UNLOAD_DELAY_SECONDS = 3.0
+JOB_STATE_POLL_SECONDS = 0.05
 
 _purge_lock = threading.RLock()
-_timer_lock = threading.Lock()
-_pending_timer = None
+_worker_lock = threading.Lock()
 _pending_token = 0
+_pending_worker = None
 
 
 def _normalize_mode(mode):
@@ -164,7 +165,7 @@ def _log_unload_result(elapsed, before, after, collected):
 
 
 def _perform_unload():
-    """Run the actual Forge-managed model unload while the generation queue is idle."""
+    """Run the actual Forge-managed model unload."""
     with _purge_lock:
         start = time.perf_counter()
         before = _cuda_memory_snapshot()
@@ -196,36 +197,75 @@ def _perform_unload():
         _log_unload_result(time.perf_counter() - start, before, after, collected)
 
 
+def _token_is_current(token):
+    with _worker_lock:
+        return token == _pending_token
+
+
 def _cancel_pending_unload():
-    """Invalidate and cancel any delayed unload that has not started yet."""
-    global _pending_timer, _pending_token
+    """Invalidate any worker waiting to unload after the current/previous job."""
+    global _pending_token, _pending_worker
 
-    with _timer_lock:
+    with _worker_lock:
         _pending_token += 1
-        timer = _pending_timer
-        _pending_timer = None
+        _pending_worker = None
 
-    if timer is not None:
-        timer.cancel()
+
+def _wait_for_current_job_to_end(token):
+    """Wait until Forge's shared state says the active generation has ended."""
+    while True:
+        if not _token_is_current(token):
+            return False
+
+        if not getattr(shared.state, "job", ""):
+            return True
+
+        time.sleep(JOB_STATE_POLL_SECONDS)
+
+
+def _wait_idle_grace(token):
+    """Wait the full grace interval while allowing a new generation to cancel it."""
+    deadline = time.monotonic() + IDLE_UNLOAD_DELAY_SECONDS
+
+    while True:
+        if not _token_is_current(token):
+            return False
+
+        # A new job can become active before this extension's before_process() runs.
+        if getattr(shared.state, "job", ""):
+            return False
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+
+        time.sleep(min(JOB_STATE_POLL_SECONDS, remaining))
 
 
 def _scheduled_unload_worker(token):
-    """Unload only if no newer generation invalidated this timer."""
-    global _pending_timer
+    """Unload only after the outer Forge job has ended and remained idle."""
+    global _pending_worker
 
     try:
-        # Forge Neo's UI and API share this queue lock. Waiting on it prevents
-        # the timer thread from unloading models during active generation.
+        # postprocess() runs before shared.state.end(). Do not count the idle grace
+        # from postprocess; first wait for the outer job to genuinely end.
+        if not _wait_for_current_job_to_end(token):
+            return
+
+        if not _wait_idle_grace(token):
+            return
+
+        # The Web UI and API share this queue lock. If a generation starts at the
+        # grace boundary, wait for it to finish and then reject this stale token.
         from modules.call_queue import queue_lock
 
         with queue_lock:
-            with _timer_lock:
-                if token != _pending_token:
-                    return
-                _pending_timer = None
+            if not _token_is_current(token):
+                return
 
-            # Re-check the setting in case the user changed modes while the
-            # timer was waiting.
+            if getattr(shared.state, "job", ""):
+                return
+
             mode = _normalize_mode(getattr(shared.opts, OPTION_KEY, DEFAULT_MODE))
             if mode != MODE_UNLOAD_GPU:
                 return
@@ -234,31 +274,31 @@ def _scheduled_unload_worker(token):
     except Exception:
         # Delayed cleanup must never affect generation or server stability.
         logger.exception("Scheduled Auto VRAM Purge failed")
+    finally:
+        with _worker_lock:
+            if token == _pending_token and _pending_worker is threading.current_thread():
+                _pending_worker = None
 
 
 def _schedule_unload():
-    """Schedule one unload after a short idle grace period."""
-    global _pending_timer, _pending_token
+    """Schedule one idle-aware unload worker."""
+    global _pending_token, _pending_worker
 
-    with _timer_lock:
-        old_timer = _pending_timer
+    with _worker_lock:
         _pending_token += 1
         token = _pending_token
 
-        timer = threading.Timer(
-            IDLE_UNLOAD_DELAY_SECONDS,
-            _scheduled_unload_worker,
+        worker = threading.Thread(
+            target=_scheduled_unload_worker,
             args=(token,),
+            name="ForgeNeoAutoVRAMPurge",
+            daemon=True,
         )
-        timer.daemon = True
-        _pending_timer = timer
+        _pending_worker = worker
 
-    if old_timer is not None:
-        old_timer.cancel()
-
-    timer.start()
+    worker.start()
     logger.debug(
-        "Auto VRAM Purge scheduled after %.1fs idle grace period",
+        "Auto VRAM Purge armed; unload after job end + %.1fs idle",
         IDLE_UNLOAD_DELAY_SECONDS,
     )
 
@@ -297,8 +337,9 @@ class AutoVRAMPurgeScript(scripts.Script):
         return []
 
     def before_process(self, p, *args):
-        # Any new generation invalidates a pending idle unload. This keeps
-        # Generate forever fast because the next job starts before the grace ends.
+        # Any new outer generation invalidates a pending idle unload.
+        if getattr(p, "_ad_inner", False):
+            return
         _cancel_pending_unload()
 
     def postprocess(self, p, processed, *args):
