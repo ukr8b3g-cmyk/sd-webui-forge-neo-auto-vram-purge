@@ -23,18 +23,21 @@ DEFAULT_MODE = MODE_UNLOAD_GPU
 VALID_MODES = {MODE_FORGE_DEFAULT, MODE_UNLOAD_GPU}
 LEGACY_FORGE_DEFAULT_MODES = {"OFF", "Cache Only"}
 OPTION_KEY = "forge_neo_auto_vram_purge_mode"
-VERSION = "1.2.5"
+VERSION = "1.2.6"
 
-# Generate forever polls every 500 ms, but the browser can only request the next
-# job after the previous Gradio response/UI update has completed. Start this grace
-# period after the current Forge queue job is actually idle, not from postprocess().
-IDLE_UNLOAD_DELAY_SECONDS = 3.0
+# Browser-side Generate Forever detection is authoritative while its heartbeat is
+# alive. If the browser disappears without sending a stop signal, the TTL lets the
+# backend recover automatically instead of keeping models resident forever.
+IDLE_UNLOAD_DELAY_SECONDS = 1.5
 JOB_STATE_POLL_SECONDS = 0.05
+CONTINUOUS_GUARD_TTL_SECONDS = 6.0
 
 _purge_lock = threading.RLock()
 _worker_lock = threading.Lock()
 _pending_token = 0
 _pending_worker = None
+_continuous_lock = threading.Lock()
+_continuous_guard_until = 0.0
 
 
 def _normalize_mode(mode):
@@ -211,6 +214,48 @@ def _cancel_pending_unload():
         _pending_worker = None
 
 
+def _continuous_generation_active():
+    with _continuous_lock:
+        return time.monotonic() < _continuous_guard_until
+
+
+def _clear_continuous_generation():
+    global _continuous_guard_until
+
+    with _continuous_lock:
+        _continuous_guard_until = 0.0
+
+
+def _set_continuous_generation(active):
+    """Update the frontend-reported Generate Forever guard."""
+    global _continuous_guard_until
+
+    now = time.monotonic()
+    with _continuous_lock:
+        was_active = now < _continuous_guard_until
+        if active:
+            _continuous_guard_until = now + CONTINUOUS_GUARD_TTL_SECONDS
+        else:
+            _continuous_guard_until = 0.0
+
+    # Only invalidate the current worker when Generate Forever first becomes
+    # active. Heartbeats merely extend the guard and do not churn worker tokens.
+    if active and not was_active:
+        _cancel_pending_unload()
+        logger.info("Generate Forever guard active; GPU model unload suspended")
+        return
+
+    if not active:
+        if was_active:
+            logger.info("Generate Forever guard inactive; idle unload resumed")
+
+        # Cancel can happen after the last postprocess worker was superseded by a
+        # heartbeat/new job. Arm a fresh worker so the final VRAM release is not lost.
+        mode = _normalize_mode(getattr(shared.opts, OPTION_KEY, DEFAULT_MODE))
+        if mode == MODE_UNLOAD_GPU:
+            _schedule_unload()
+
+
 def _wait_for_current_job_to_end(token):
     """Wait until Forge's shared state says the active generation has ended."""
     while True:
@@ -224,16 +269,25 @@ def _wait_for_current_job_to_end(token):
 
 
 def _wait_idle_grace(token):
-    """Wait the full grace interval while allowing a new generation to cancel it."""
-    deadline = time.monotonic() + IDLE_UNLOAD_DELAY_SECONDS
+    """Wait for true idle time; Generate Forever heartbeats pause the countdown."""
+    deadline = None
 
     while True:
         if not _token_is_current(token):
             return False
 
-        # A new job can become active before this extension's before_process() runs.
         if getattr(shared.state, "job", ""):
             return False
+
+        # While Generate Forever is active, do not count any idle gap toward the
+        # unload delay. This avoids depending on browser/Gradio response timing.
+        if _continuous_generation_active():
+            deadline = None
+            time.sleep(JOB_STATE_POLL_SECONDS)
+            continue
+
+        if deadline is None:
+            deadline = time.monotonic() + IDLE_UNLOAD_DELAY_SECONDS
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -243,12 +297,10 @@ def _wait_idle_grace(token):
 
 
 def _scheduled_unload_worker(token):
-    """Unload only after the outer Forge job has ended and remained idle."""
+    """Unload only after the outer Forge job has ended and remained truly idle."""
     global _pending_worker
 
     try:
-        # postprocess() runs before shared.state.end(). Do not count the idle grace
-        # from postprocess; first wait for the outer job to genuinely end.
         if not _wait_for_current_job_to_end(token):
             return
 
@@ -264,6 +316,9 @@ def _scheduled_unload_worker(token):
                 return
 
             if getattr(shared.state, "job", ""):
+                return
+
+            if _continuous_generation_active():
                 return
 
             mode = _normalize_mode(getattr(shared.opts, OPTION_KEY, DEFAULT_MODE))
@@ -298,9 +353,18 @@ def _schedule_unload():
 
     worker.start()
     logger.debug(
-        "Auto VRAM Purge armed; unload after job end + %.1fs idle",
+        "Auto VRAM Purge armed; unload after %.1fs true idle",
         IDLE_UNLOAD_DELAY_SECONDS,
     )
+
+
+def _register_api(_, app):
+    """Receive the browser-side Generate Forever state/heartbeat."""
+
+    @app.post("/forge-neo-auto-vram-purge/continuous", include_in_schema=False)
+    async def forge_neo_auto_vram_purge_continuous(active: bool):
+        _set_continuous_generation(bool(active))
+        return {"ok": True, "active": bool(active)}
 
 
 def on_ui_settings():
@@ -321,8 +385,14 @@ def on_ui_settings():
     )
 
 
+def _shutdown_extension():
+    _clear_continuous_generation()
+    _cancel_pending_unload()
+
+
 script_callbacks.on_ui_settings(on_ui_settings)
-script_callbacks.on_script_unloaded(_cancel_pending_unload)
+script_callbacks.on_app_started(_register_api, name="forge_neo_auto_vram_purge_api")
+script_callbacks.on_script_unloaded(_shutdown_extension)
 logger.info("Forge Neo Auto VRAM Purge v%s loaded", VERSION)
 
 
@@ -337,7 +407,8 @@ class AutoVRAMPurgeScript(scripts.Script):
         return []
 
     def before_process(self, p, *args):
-        # Any new outer generation invalidates a pending idle unload.
+        # Any new outer generation invalidates a pending idle unload. The browser
+        # guard independently keeps Generate Forever protected across UI gaps.
         if getattr(p, "_ad_inner", False):
             return
         _cancel_pending_unload()
