@@ -11,6 +11,7 @@
 
     let continuousActive = false;
     let heartbeatTimer = null;
+    let clickListenerInstalled = false;
 
     function sendState(active, keepalive = false) {
         const url = `${endpoint}?active=${active ? "true" : "false"}&t=${Date.now()}`;
@@ -41,24 +42,40 @@
         }
     }
 
-    document.addEventListener(
-        "click",
-        (event) => {
-            const target = event.target;
-            const item = target && target.closest ? target.closest("#context-menu a") : null;
-            if (!item) {
-                return;
-            }
+    function handleContextMenuClick(event) {
+        const target = event.target;
+        const item = target && target.closest ? target.closest("#context-menu a") : null;
+        if (!item) {
+            return;
+        }
 
-            const label = (item.textContent || "").trim();
-            if (label === "Generate forever") {
-                setContinuousActive(true);
-            } else if (label === "Cancel generate forever") {
-                setContinuousActive(false);
-            }
-        },
-        true,
-    );
+        const label = (item.textContent || "").trim();
+        if (label === "Generate forever") {
+            setContinuousActive(true);
+        } else if (label === "Cancel generate forever") {
+            setContinuousActive(false);
+        }
+    }
+
+    function installClickListener() {
+        if (clickListenerInstalled) {
+            return;
+        }
+
+        const root = typeof gradioApp === "function" ? gradioApp() : document;
+        if (!root || !root.addEventListener) {
+            return;
+        }
+
+        root.addEventListener("click", handleContextMenuClick, true);
+        clickListenerInstalled = true;
+    }
+
+    if (typeof onUiLoaded === "function") {
+        onUiLoaded(installClickListener);
+    } else {
+        window.addEventListener("load", installClickListener, {once: true});
+    }
 
     window.addEventListener("beforeunload", () => {
         if (!continuousActive) {
