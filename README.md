@@ -9,7 +9,7 @@ A small Forge Neo extension that can automatically unload GPU-resident models af
 
 In practical testing, it returned roughly **3.7–3.8 GiB of VRAM** after normal steady-state runs. On the tested system, moving the main KModel back to the GPU took roughly **0.9–1.1 seconds**.
 
-From **v1.2.4**, model unloading is idle-aware: the extension waits **1.5 seconds** after a generation before unloading. If another generation starts during that grace period, the pending unload is cancelled. This avoids needless unload/reload cycles during Forge Neo's **Generate forever** mode.
+From **v1.2.5**, model unloading is idle-aware: the extension first waits until the Forge generation job has genuinely ended, then requires **3.0 seconds of idle time** before unloading. If another generation starts during that grace period, the pending unload is cancelled. This avoids needless unload/reload cycles during Forge Neo's **Generate forever** mode.
 
 If model transfer is noticeably slow on your machine, use **`Forge Default`** instead.
 
@@ -24,15 +24,15 @@ The extension adds one setting under:
 `After-generation memory policy`
 
 - **Forge Default** — The extension performs no extra purge. Forge Neo continues to run its own normal cache cleanup.
-- **Unload GPU Models** — Uses Forge Neo's own memory manager to unload GPU-resident models after a short idle grace period. This is the default and usually returns substantially more VRAM.
+- **Unload GPU Models** — Uses Forge Neo's own memory manager to unload GPU-resident models after a confirmed idle grace period. This is the default and usually returns substantially more VRAM.
 
 No controls are added to txt2img or img2img.
 
-## Generate forever / continuous generation — v1.2.4
+## Generate forever / continuous generation — v1.2.5
 
 Forge Neo's built-in **Generate forever** implementation checks every **500 ms** for the previous generation to finish and then starts another generation.
 
-Before v1.2.4, `Unload GPU Models` ran immediately after every generation. That meant a continuous loop could become:
+Before the idle guard, `Unload GPU Models` ran immediately after every generation. That meant a continuous loop could become:
 
 ```text
 Generation 1
@@ -46,35 +46,41 @@ Generation 1
 
 In the tested workflow, the next KModel move alone took about **0.98–1.08 seconds**, with the VAE move adding roughly another **0.10 seconds**. This made Generate forever feel as though it had a noticeable pause between images even though the actual purge itself was only around 0.13–0.15 seconds.
 
-v1.2.4 changes the behavior to:
+### Why v1.2.4 was not sufficient
+
+v1.2.4 started its 1.5-second grace period from extension `postprocess()`. That hook runs before Forge Neo has completely ended the outer job and before the browser necessarily receives and applies the final Gradio response. In testing, the grace period could therefore expire before Generate forever submitted the next request, so models were still unloaded between generations.
+
+v1.2.5 changes the timing model:
 
 ```text
-Generation finishes
-→ schedule unload after 1.5 s idle
-→ if another generation starts first: cancel unload
-→ keep models resident
+Extension postprocess()
+→ wait until shared Forge job state is actually idle
+→ start 3.0 s idle grace
+→ if another generation starts: invalidate pending unload
+→ otherwise unload GPU models once
 ```
 
 When Generate forever is cancelled and no new generation starts:
 
 ```text
-Last generation finishes
-→ 1.5 s idle grace
+Last generation genuinely ends
+→ 3.0 s idle grace
 → unload GPU models once
 ```
 
-So continuous generation keeps its model residency and speed, while VRAM is still returned shortly after generation activity stops.
+So continuous generation can keep model residency and speed, while VRAM is still returned shortly after generation activity stops.
 
 ### Concurrency safety
 
 The delayed unload is protected by:
 
-- a generation token that invalidates stale timers;
-- cancellation from the next `before_process()` call;
+- a generation token that invalidates stale workers;
+- cancellation from the next outer `before_process()` call;
+- direct checks of Forge Neo's shared job state while waiting;
 - Forge Neo's shared generation `queue_lock`, used by both the Web UI and API;
-- daemon timers that are cancelled when the extension is unloaded/reloaded.
+- daemon workers that are invalidated when the extension is unloaded/reloaded.
 
-A timer that has already fired cannot unload models in the middle of an active queued generation.
+A worker that reaches the grace boundary cannot unload models in the middle of an active queued generation.
 
 ## Why `Cache Only` was removed in v1.2.3
 
@@ -189,7 +195,7 @@ A later four-run test produced:
 
 Average purge time was about **0.140 seconds**. Observed KModel moves between immediate-unload runs were about **0.98–1.08 seconds**, plus roughly **0.10 seconds** for the VAE. Those repeated model moves, rather than the ~0.14-second purge itself, were the main reason continuous generation felt slower.
 
-v1.2.4 is designed specifically to remove those repeated unload/reload cycles during short-gap continuous generation. Its continuous-generation behavior should be re-measured after updating.
+v1.2.5 is designed specifically to prevent those repeated unload/reload cycles by measuring the idle grace only after the Forge job has genuinely ended. Its continuous-generation behavior should be re-measured after updating.
 
 ## ADetailer compatibility
 
@@ -208,14 +214,16 @@ No extension-side memory operation
 → Forge Neo native cleanup continues normally
 ```
 
-### Unload GPU Models — v1.2.4 normal path
+### Unload GPU Models — v1.2.5 normal path
 
 ```text
-Outer generation finishes
-→ schedule 1.5 s idle timer
-→ next generation starts before timeout: cancel timer
+Outer postprocess finishes
+→ wait until Forge shared job state is empty
+→ start 3.0 s idle grace
+→ next generation starts before timeout: invalidate worker
 OR
-→ timer expires while queue is idle
+→ grace expires while queue remains idle
+→ acquire Forge queue lock
 → Forge Neo backend.memory_management.unload_all_models()
 → log result
 ```
@@ -237,10 +245,10 @@ gc.collect()
 On startup:
 
 ```text
-Forge Neo Auto VRAM Purge v1.2.4 loaded
+Forge Neo Auto VRAM Purge v1.2.5 loaded
 ```
 
-With `Unload GPU Models`, a successful one-shot generation should show the unload completion line roughly **1.5 seconds after the job becomes idle**:
+With `Unload GPU Models`, a successful one-shot generation should show the unload completion line roughly **3 seconds after the Forge job becomes genuinely idle**:
 
 ```text
 Auto VRAM Purge completed: Unload GPU Models | 0.xxxs | GC=skipped | CUDA free ...
@@ -254,10 +262,11 @@ During a working Generate forever loop, you should normally **not** see that lin
 
 - Uses Forge Neo's native `unload_all_models()` rather than manipulating model objects directly.
 - Does not duplicate Forge Neo's standard cache cleanup in `Forge Default` mode.
-- Uses a 1.5-second idle grace period to avoid continuous-generation unload/reload churn.
+- Starts the idle grace only after Forge's shared job state reports that the outer generation has ended.
+- Uses a 3.0-second idle grace to cover browser/Gradio response time before Generate forever submits the next request.
 - Uses Forge Neo's shared queue lock so delayed unload does not race active Web UI/API generation.
-- Uses token invalidation so already-fired stale timers cannot unload after a newer generation starts.
-- Cancels pending timers when the extension is unloaded/reloaded.
+- Uses token invalidation so stale workers cannot unload after a newer generation starts.
+- Invalidates pending workers when the extension is unloaded/reloaded.
 - Skips ADetailer internal `_ad_inner` generations.
 - Avoids redundant full Python GC and second allocator cleanup on successful unloads.
 - Full Python GC and forced cache cleanup remain available as an abnormal-path fallback.
@@ -278,4 +287,4 @@ Designed for Forge Neo. Other A1111/Forge forks are not guaranteed to expose the
 
 ## Version
 
-v1.2.4
+v1.2.5
