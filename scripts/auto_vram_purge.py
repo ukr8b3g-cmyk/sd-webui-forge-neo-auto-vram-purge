@@ -17,15 +17,26 @@ except Exception:
     # Keep the extension usable on compatible forks without Forge Neo's logger helper.
     logger.setLevel(logging.INFO)
 
-MODE_OFF = "OFF"
-MODE_CACHE_ONLY = "Cache Only"
+MODE_FORGE_DEFAULT = "Forge Default"
 MODE_UNLOAD_GPU = "Unload GPU Models"
 DEFAULT_MODE = MODE_UNLOAD_GPU
-VALID_MODES = {MODE_OFF, MODE_CACHE_ONLY, MODE_UNLOAD_GPU}
+VALID_MODES = {MODE_FORGE_DEFAULT, MODE_UNLOAD_GPU}
+LEGACY_FORGE_DEFAULT_MODES = {"OFF", "Cache Only"}
 OPTION_KEY = "forge_neo_auto_vram_purge_mode"
-VERSION = "1.2.2"
+VERSION = "1.2.3"
 
 _purge_lock = threading.RLock()
+
+
+def _normalize_mode(mode):
+    """Map old saved settings to the v1.2.3 two-mode policy."""
+    if mode in LEGACY_FORGE_DEFAULT_MODES:
+        return MODE_FORGE_DEFAULT
+    if mode in VALID_MODES:
+        return mode
+
+    logger.warning("Unknown Auto VRAM Purge mode %r; using %s", mode, DEFAULT_MODE)
+    return DEFAULT_MODE
 
 
 def _get_forge_memory_manager():
@@ -39,7 +50,7 @@ def _get_forge_memory_manager():
 
 
 def _fallback_empty_accelerator_cache():
-    """Best-effort cache cleanup when Forge's helper is unavailable."""
+    """Best-effort allocator cleanup when Forge's helper is unavailable."""
     try:
         if torch.cuda.is_available():
             try:
@@ -76,8 +87,8 @@ def _fallback_empty_accelerator_cache():
         logger.debug("MPS cache cleanup failed", exc_info=True)
 
 
-def _empty_accelerator_cache(memory_management):
-    """Prefer Forge Neo's cache cleanup so allocator handling matches the host."""
+def _recovery_cache_cleanup(memory_management):
+    """Force allocator cleanup only on the abnormal unload fallback path."""
     soft_empty_cache = getattr(memory_management, "soft_empty_cache", None) if memory_management else None
 
     if callable(soft_empty_cache):
@@ -105,7 +116,6 @@ def _cuda_memory_snapshot():
 
         free_bytes, total_bytes = torch.cuda.mem_get_info()
         return {
-            "allocated": torch.cuda.memory_allocated(),
             "reserved": torch.cuda.memory_reserved(),
             "free": free_bytes,
             "total": total_bytes,
@@ -119,7 +129,7 @@ def _format_mib(value):
     return value / (1024 * 1024)
 
 
-def _log_result(mode, elapsed, before, after, collected):
+def _log_unload_result(elapsed, before, after, collected):
     gc_result = "skipped" if collected is None else str(collected)
 
     if before and after:
@@ -127,7 +137,7 @@ def _log_result(mode, elapsed, before, after, collected):
         logger.info(
             "Auto VRAM Purge completed: %s | %.3fs | GC=%s | "
             "CUDA free %.0f -> %.0f MiB (%+.0f MiB) | reserved %.0f -> %.0f MiB",
-            mode,
+            MODE_UNLOAD_GPU,
             elapsed,
             gc_result,
             _format_mib(before["free"]),
@@ -139,18 +149,18 @@ def _log_result(mode, elapsed, before, after, collected):
     else:
         logger.info(
             "Auto VRAM Purge completed: %s | %.3fs | GC=%s",
-            mode,
+            MODE_UNLOAD_GPU,
             elapsed,
             gc_result,
         )
 
 
 def purge_memory(mode):
-    if mode not in VALID_MODES:
-        logger.warning("Unknown Auto VRAM Purge mode %r; using %s", mode, DEFAULT_MODE)
-        mode = DEFAULT_MODE
+    mode = _normalize_mode(mode)
 
-    if mode == MODE_OFF:
+    # Forge Default intentionally does nothing here. Forge Neo already runs
+    # devices.torch_gc() / soft_empty_cache() in its normal generation lifecycle.
+    if mode == MODE_FORGE_DEFAULT:
         return
 
     with _purge_lock:
@@ -158,45 +168,45 @@ def purge_memory(mode):
         before = _cuda_memory_snapshot()
         memory_management = _get_forge_memory_manager()
         collected = None
+        unload_ok = False
 
-        if mode == MODE_UNLOAD_GPU:
-            unload_ok = False
-            unload_all_models = getattr(memory_management, "unload_all_models", None) if memory_management else None
+        unload_all_models = getattr(memory_management, "unload_all_models", None) if memory_management else None
+        if callable(unload_all_models):
+            try:
+                # Forge's unload_all_models() already routes through free_memory(),
+                # which performs model bookkeeping and cache cleanup when models unload.
+                unload_all_models()
+                unload_ok = True
+            except Exception:
+                logger.exception("Failed to unload Forge-managed GPU models")
+        else:
+            logger.warning(
+                "Forge Neo unload_all_models() is unavailable; falling back to GC and cache cleanup"
+            )
 
-            if callable(unload_all_models):
-                try:
-                    unload_all_models()
-                    unload_ok = True
-                except Exception:
-                    logger.exception("Failed to unload Forge-managed GPU models")
-            else:
-                logger.warning(
-                    "Forge Neo unload_all_models() is unavailable; falling back to GC and cache cleanup"
-                )
-
-            # Forge Neo's successful unload path already performs its own model bookkeeping
-            # and allocator cleanup. Avoid a second full Python GC on the normal path.
-            # Retain full GC only as a safety fallback if host-model unloading is unavailable/fails.
-            if not unload_ok:
-                collected = gc.collect()
-
-        # Both modes finish with Forge Neo's forced allocator cleanup. Cache Only intentionally
-        # skips full Python GC; Unload GPU Models also skips it after a successful host unload.
-        _empty_accelerator_cache(memory_management)
+        # Normal path: do not repeat Forge's allocator cleanup or full Python GC.
+        # Abnormal path: retain stronger best-effort recovery.
+        if not unload_ok:
+            collected = gc.collect()
+            _recovery_cache_cleanup(memory_management)
 
         after = _cuda_memory_snapshot()
-        _log_result(mode, time.perf_counter() - start, before, after, collected)
+        _log_unload_result(time.perf_counter() - start, before, after, collected)
 
 
 def on_ui_settings():
+    # Migrate old in-memory saved values so the two-choice dropdown is valid.
+    if shared.opts.data.get(OPTION_KEY) in LEGACY_FORGE_DEFAULT_MODES:
+        shared.opts.data[OPTION_KEY] = MODE_FORGE_DEFAULT
+
     section = ("forge_neo_auto_vram_purge", "Forge Neo Auto VRAM Purge")
     shared.opts.add_option(
         OPTION_KEY,
         shared.OptionInfo(
             DEFAULT_MODE,
-            "Memory cleanup after generation",
+            "After-generation memory policy",
             gr.Dropdown,
-            {"choices": [MODE_OFF, MODE_CACHE_ONLY, MODE_UNLOAD_GPU]},
+            {"choices": [MODE_FORGE_DEFAULT, MODE_UNLOAD_GPU]},
             section=section,
         ),
     )
@@ -217,6 +227,11 @@ class AutoVRAMPurgeScript(scripts.Script):
         return []
 
     def postprocess(self, p, processed, *args):
+        # ADetailer creates internal img2img jobs. Purging inside those nested jobs
+        # would force unnecessary model reloads before the outer generation finishes.
+        if getattr(p, "_ad_inner", False):
+            return
+
         mode = getattr(shared.opts, OPTION_KEY, DEFAULT_MODE)
         try:
             purge_memory(mode)
