@@ -1,5 +1,6 @@
 # Forge Neo Auto VRAM Purge
-<img width="299" height="170" alt="{CF43CBAA-6A3C-4286-8335-296344AF214E}" src="https://github.com/user-attachments/assets/4ec31864-5ddc-4685-a228-f5dc99d65492" />
+<img width="228" height="149" alt="{9917F30E-10C1-4624-89D2-915A07150E58}" src="https://github.com/user-attachments/assets/53284edf-a2cf-4ebf-b527-da69b0754f01" />
+
 
 A small Forge Neo extension that can automatically unload GPU-resident models after generation to return VRAM to the system.
 
