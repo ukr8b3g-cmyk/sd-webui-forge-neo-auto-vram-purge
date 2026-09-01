@@ -1,17 +1,17 @@
 # Forge Neo Auto VRAM Purge
 <img width="299" height="170" alt="{CF43CBAA-6A3C-4286-8335-296344AF214E}" src="https://github.com/user-attachments/assets/4ec31864-5ddc-4685-a228-f5dc99d65492" />
 
-A small Forge Neo extension that automatically cleans GPU memory after a generation job finishes.
+A small Forge Neo extension that can automatically unload GPU-resident models after generation to return VRAM to the system.
 
 ## Recommended default
 
-**`Unload GPU Models` is the default mode from v1.2.0.**
+**`Unload GPU Models` is the default mode.**
 
-In practical testing, unloading Forge-managed GPU models released several GiB of VRAM while adding only a small amount of cleanup time. On systems where model movement is fast, the difference can be difficult to notice during normal generation.
+In practical testing, it returned roughly **3.8 GiB of VRAM** after normal runs while adding only a small unload cost. On systems with fast RAM/PCIe model transfer, the next generation delay was about one second in the tested setup.
 
-If the next generation becomes noticeably slower on your system, switch to **`Cache Only`**.
+If model transfer is noticeably slow on your machine, use **`Forge Default`** instead.
 
-> Existing installations may keep a previously saved setting. Changing the extension default does not intentionally overwrite a user's saved Forge Neo setting.
+> Existing installations that previously saved `OFF` or `Cache Only` are treated as `Forge Default` in v1.2.3.
 
 ## Settings
 
@@ -19,64 +19,107 @@ The extension adds one setting under:
 
 **Settings → Forge Neo Auto VRAM Purge**
 
-`Memory cleanup after generation`
+`After-generation memory policy`
 
-- **OFF** — Do nothing after generation.
-- **Cache Only** — Keep Forge-managed models loaded and force Forge Neo's allocator cache cleanup. Full Python garbage collection is intentionally skipped for minimum latency.
-- **Unload GPU Models** — Ask Forge Neo's memory manager to unload GPU-resident models, then force allocator cache cleanup. This is the default mode and usually releases substantially more VRAM. From v1.2.2, a successful Forge Neo unload no longer runs a second full Python GC.
+- **Forge Default** — The extension performs no extra purge. Forge Neo continues to run its own normal cache cleanup.
+- **Unload GPU Models** — Uses Forge Neo's own memory manager to unload GPU-resident models after generation. This is the default and usually returns substantially more VRAM.
 
 No controls are added to txt2img or img2img.
+
+## Why `Cache Only` was removed in v1.2.3
+
+Forge Neo already performs cache cleanup as part of its normal generation lifecycle.
+
+Before extension `postprocess()` runs, Forge Neo calls:
+
+```text
+devices.torch_gc()
+→ backend.memory_management.soft_empty_cache()
+```
+
+Forge Neo also runs `devices.torch_gc()` again when the generation job ends. The Gradio generation wrapper contains another cleanup path as well.
+
+Therefore the old extension-side `Cache Only` mode was duplicating cleanup that Forge Neo already performs automatically.
+
+This also explains the test result where `Cache Only` repeatedly showed:
+
+```text
+CUDA free 11002 -> 11002 MiB (+0 MiB)
+reserved 4096 -> 4096 MiB
+```
+
+The extension had nothing additional to release because Forge Neo had already cleaned its allocator cache.
+
+### Important
+
+`Forge Default` does **not** mean GPU cache cleanup is disabled.
+
+It means:
+
+```text
+Extension extra purge: OFF
+Forge Neo native cleanup: ON
+```
+
+This is the correct replacement for the previous `OFF` and `Cache Only` choices.
 
 ## Which mode should I use?
 
 ### Unload GPU Models — recommended
 
-Use this when you want VRAM returned after each generation, especially when:
+Use this when:
 
+- you want VRAM returned after every generation;
 - another GPU application may run alongside Forge Neo;
 - you use larger models or workflows where free VRAM is valuable;
 - your system can move models back to the GPU quickly;
-- you prefer predictable low idle VRAM usage after generation.
+- you prefer predictable low idle VRAM usage.
 
-A 12 GB VRAM-class GPU can also benefit from this mode, but suitability depends on the model, resolution, quantization, extensions, system RAM, and workflow. It is not a guarantee that every 12 GB configuration will behave the same way.
+A 12 GB VRAM-class GPU can also benefit, but suitability depends on model size, quantization, resolution, extensions, system RAM, and workflow.
 
-### Cache Only — fastest / minimum reload overhead
+### Forge Default — minimum overhead
 
-Use this when model reload or transfer is noticeably slow on your machine, or when you only want Forge's unused allocator cache returned.
+Use this when:
 
-`Cache Only` intentionally does **not** unload the checkpoint, UNet, VAE, or text encoder. Because those objects stay resident, Task Manager or `nvidia-smi` may show only a small decrease — or **0 MiB** of additional VRAM released. This is normal and does not mean the extension failed.
+- model transfer back to the GPU is slow;
+- you do not need VRAM returned between generations;
+- you prefer Forge Neo's normal memory behavior without extra model unloading.
 
-Forge Neo already performs active memory management during generation, so by the time a job finishes there may simply be no unused CUDA allocator cache left to return.
-
-From **v1.2.1**, `Cache Only` no longer runs a full `gc.collect()`. In testing, full Python GC collected many objects but released **0 MiB** of additional CUDA memory while adding about **0.26–0.30 seconds** per cleanup. Removing that full GC reduced measured Cache Only cleanup to approximately **0.000–0.001 seconds**.
+Forge Neo still performs its standard allocator cleanup automatically.
 
 ## SSD, RAM, and reload speed
 
-Fast storage can help when Forge Neo actually needs to read model data from disk, such as startup, model switching, or a true model reload.
+Fast storage helps when Forge Neo must actually read model data from disk, such as startup, model switching, or a true model reload.
 
-However, `Unload GPU Models` uses Forge Neo's own memory manager and normally removes GPU residency rather than deleting the entire model from host memory. Therefore, the next-generation cost can be dominated by **RAM/CPU-to-VRAM transfer, PCIe bandwidth, memory bandwidth, model size, and Forge's offload state**, not SSD speed alone.
+However, `Unload GPU Models` normally removes GPU residency through Forge Neo's model manager rather than deleting the entire model from host memory. The next-generation cost is therefore often dominated by:
 
-This is why a system with adequate RAM and fast model transfer may show very little practical difference between keeping models resident and unloading them after every generation. If your machine shows a large delay, use `Cache Only` instead.
+- RAM/CPU-to-VRAM transfer;
+- PCIe bandwidth;
+- system memory bandwidth;
+- model size;
+- Forge Neo's current offload state.
 
-## Informal performance test
+This is why a system with adequate RAM and fast model transfer can show little practical difference between keeping models GPU-resident and unloading them after each generation.
 
-The following results are from a simple real-world test on one Forge Neo setup. They are **not a universal benchmark**; model size, GPU, RAM, storage, PCIe link, Forge settings, and workflow will change the result.
+## Informal performance tests
 
-### Cache Only optimization
+These measurements are from one real Forge Neo setup and are **not universal benchmarks**.
 
-Pre-v1.2.1:
+### Old Cache Only path
+
+Before v1.2.1, the extension also ran full Python garbage collection:
 
 | Mode | Runs | Cleanup time | Additional VRAM released |
 |---|---:|---:|---:|
-| Cache Only with full GC | 4 | ~0.263–0.304 s, ~0.277 s average | 0 MiB in all runs |
+| Cache Only + full GC | 4 | ~0.263–0.304 s, ~0.277 s average | 0 MiB |
 
-v1.2.1+:
+After removing redundant full GC in v1.2.1:
 
 | Mode | Runs | Cleanup time | Additional VRAM released |
 |---|---:|---:|---:|
-| Cache Only without full GC | 4 | 0.000–0.001 s | 0 MiB in all runs |
+| Cache Only | 4 | 0.000–0.001 s | 0 MiB |
 
-The measured cleanup overhead therefore dropped by roughly **99%+** while preserving the same observed VRAM result.
+The test confirmed that the extension-side Cache Only path did not provide additional VRAM release. In v1.2.3 it was removed completely because Forge Neo already performs the same allocator cleanup itself.
 
 ### Unload GPU Models — v1.2.1 baseline
 
@@ -90,115 +133,110 @@ Representative runs:
 | 0.400 s | 11034 → 14810 MiB | +3776 MiB | 4064 → 288 MiB |
 | 0.395 s | 11034 → 14810 MiB | +3776 MiB | 4064 → 288 MiB |
 
-The stable unload runs were around **0.39–0.40 seconds**, with the first heavier run taking 0.734 seconds. Observed next KModel moves were about **0.96–1.09 seconds**.
+Stable runs were around **0.39–0.40 seconds**.
 
-### Unload GPU Models — v1.2.2 optimized
+### Unload GPU Models — v1.2.2
 
-From v1.2.2, a successful Forge Neo `unload_all_models()` path skips the extension's second full `gc.collect()`. Forge Neo already performs model bookkeeping and memory cleanup during its unload path, so the extra full Python GC was redundant in the tested setup.
+After skipping redundant extension-level full Python GC, the measured runs were:
 
-Measured v1.2.2 runs:
+| Run | Purge time | VRAM released | Reserved after |
+|---|---:|---:|---:|
+| First/heavier state | 0.468 s | +5632 MiB | 192 MiB |
+| Stable 1 | 0.139 s | +3808 MiB | 256 MiB |
+| Stable 2 | 0.123 s | +3808 MiB | 256 MiB |
+| Stable 3 | 0.133 s | +3776 MiB | 288 MiB |
+| Stable 4 | 0.118 s | +3776 MiB | 288 MiB |
 
-| Purge time | CUDA free before → after | VRAM released | Reserved before → after | GC |
-|---:|---:|---:|---:|---:|
-| 0.468 s | 9282 → 14914 MiB | +5632 MiB | 5824 → 192 MiB | skipped |
-| 0.139 s | 11042 → 14850 MiB | +3808 MiB | 4064 → 256 MiB | skipped |
-| 0.123 s | 11034 → 14842 MiB | +3808 MiB | 4064 → 256 MiB | skipped |
-| 0.133 s | 11034 → 14810 MiB | +3776 MiB | 4064 → 288 MiB | skipped |
-| 0.118 s | 11034 → 14810 MiB | +3776 MiB | 4064 → 288 MiB | skipped |
+Stable four-run average: **~0.128 seconds**.
 
-The first run again had a heavier initial-state cleanup. Excluding that first run, the four stable runs were:
+Compared with the previous stable ~0.397-second baseline, this was roughly a **68% reduction in unload cleanup time** while preserving VRAM release.
 
-- **0.139 s**
-- **0.123 s**
-- **0.133 s**
-- **0.118 s**
+Observed next KModel moves were about **0.93–1.08 seconds**.
 
-Stable average: **~0.128 seconds**.
+### v1.2.3 optimization
 
-Compared with the v1.2.1 stable baseline of roughly **0.397 seconds**, the normal unload cleanup path became approximately **68% faster**, while preserving essentially the same steady-state VRAM release of about **3.8 GiB**.
+v1.2.3 removes one more redundant normal-path cleanup:
 
-Observed next KModel moves remained about **0.93–1.08 seconds**, so skipping the redundant extension-level GC did not create a noticeable model-transfer penalty in this test.
+```text
+v1.2.2
+unload_all_models()
+→ extension soft_empty_cache(force=True)
 
-In the shown v1.2.2 runs, total generation progress was around **10 seconds**, including the optimized unload cleanup. This makes the cleanup itself a small fraction of total generation time on this system.
+v1.2.3
+unload_all_models()
+→ finish
+```
 
-### Summary of measured optimization
+Forge Neo's `unload_all_models()` routes through its own `free_memory()` logic, which already performs allocator cleanup when models are unloaded. The extension now only runs explicit GC/cache recovery if Forge's unload API is unavailable or throws an error.
 
-| Mode / version | Typical cleanup time | Observed VRAM release |
-|---|---:|---:|
-| Cache Only, pre-v1.2.1 | ~0.277 s average | 0 MiB |
-| Cache Only, v1.2.1+ | ~0.000–0.001 s | 0 MiB |
-| Unload GPU Models, v1.2.1 stable | ~0.397 s | ~3.8 GiB |
-| Unload GPU Models, v1.2.2 stable | **~0.128 s** | **~3.8 GiB** |
+The v1.2.3 timing should be re-measured after updating; the v1.2.2 values above are the comparison baseline.
 
-These results support the current design: **Cache Only is effectively zero-overhead but may release nothing extra, while Unload GPU Models returns several GiB of VRAM with only a small cleanup-time cost on the tested system.**
+## ADetailer compatibility
+
+ADetailer can create internal img2img generations and marks those internal jobs with `_ad_inner = True`.
+
+From v1.2.3, Auto VRAM Purge skips those internal jobs so it does not unload GPU models between ADetailer passes.
+
+The purge runs only on the outer generation job.
 
 ## Design
 
-The extension uses Forge Neo's normal post-processing lifecycle and memory-management APIs rather than replacing the allocator or modifying Forge Neo core files.
+The extension intentionally uses Forge Neo's own memory-management APIs instead of patching allocator internals.
 
-### Cache Only cleanup order
+### Forge Default
 
-1. Skip full Python garbage collection.
-2. Forge Neo `soft_empty_cache(force=True)` when available.
-3. Compatibility fallback to native CUDA/XPU/MPS cache cleanup if Forge's helper is unavailable.
+```text
+No extension-side memory operation
+→ Forge Neo native cleanup continues normally
+```
 
-On CUDA, Forge Neo's native cache cleanup synchronizes the device, clears the PyTorch allocator cache, and performs CUDA IPC cleanup.
+### Unload GPU Models — normal path
 
-The completion log shows `GC=skipped` in this mode.
+```text
+Forge Neo backend.memory_management.unload_all_models()
+→ log result
+```
 
-### Unload GPU Models cleanup order — v1.2.2+
+No redundant extension-level full GC or second allocator cleanup is performed after a successful unload.
 
-Normal successful path:
+### Recovery path
 
-1. Forge Neo `backend.memory_management.unload_all_models()`.
-2. Skip the extension's redundant full Python GC.
-3. Forge Neo forced allocator cache cleanup.
+If Forge's model-unload API is unavailable or fails:
 
-Fallback path if Forge model unloading is unavailable or fails:
+```text
+gc.collect()
+→ Forge soft_empty_cache(force=True), if available
+→ native CUDA/XPU/MPS fallback if necessary
+```
 
-1. Log the unload problem.
-2. Run full Python `gc.collect()`.
-3. Run allocator cache cleanup.
-
-This keeps Forge Neo's own model manager authoritative while avoiding an unnecessary full GC in the common path.
+This keeps the normal path minimal while retaining a stronger abnormal-path recovery mechanism.
 
 ## Diagnostics
 
-On startup you should see:
+On startup:
 
 ```text
-Forge Neo Auto VRAM Purge v1.2.2 loaded
+Forge Neo Auto VRAM Purge v1.2.3 loaded
 ```
 
-After a generation with `Cache Only` or a successful `Unload GPU Models`, the completion line should normally show `GC=skipped`.
-
-`Cache Only` example:
+Successful unload example:
 
 ```text
-Auto VRAM Purge completed: Cache Only | 0.001s | GC=skipped | CUDA free ...
+Auto VRAM Purge completed: Unload GPU Models | 0.xxxs | GC=skipped | CUDA free ...
 ```
 
-Successful v1.2.2 unload example:
-
-```text
-Auto VRAM Purge completed: Unload GPU Models | 0.123s | GC=skipped | CUDA free 11034 -> 14842 MiB (+3808 MiB) | reserved 4064 -> 256 MiB
-```
-
-If host unloading fails, the log will instead show the number of objects collected by the fallback GC.
-
-`OFF` intentionally produces no completion line.
+`Forge Default` intentionally produces no per-generation extension cleanup line because no extra extension-side cleanup is performed.
 
 ## Reliability
 
-- Forge Neo native `soft_empty_cache()` is preferred over direct allocator calls.
-- CUDA synchronization follows Forge's memory manager.
-- `Cache Only` avoids full Python GC for lower latency.
-- Successful `Unload GPU Models` avoids a redundant second full Python GC from v1.2.2.
-- Full Python GC is retained as an abnormal-path fallback if Forge model unloading fails or is unavailable.
-- A compatibility fallback is available when a cache helper is missing or has a different signature.
-- Purge execution is serialized to prevent simultaneous cleanup operations.
-- Unknown or invalid saved setting values safely fall back to the current default.
-- Diagnostic logging reports cleanup duration, GC state/count, CUDA free memory, and allocator-reserved memory before/after cleanup.
+- Uses Forge Neo's native `unload_all_models()` rather than manipulating model objects directly.
+- Does not duplicate Forge Neo's standard cache cleanup in `Forge Default` mode.
+- Avoids redundant full Python GC on successful unloads.
+- Avoids redundant second allocator cleanup after successful unloads from v1.2.3.
+- Skips ADetailer internal `_ad_inner` generations.
+- Full Python GC and forced cache cleanup remain available as an abnormal-path fallback.
+- Cleanup execution is serialized to avoid simultaneous unload operations.
+- Legacy `OFF` and `Cache Only` saved values map safely to `Forge Default`.
 - Cleanup errors are logged and never turn an otherwise successful generation into a failed job.
 
 ## Installation
@@ -211,8 +249,8 @@ git clone https://github.com/ukr8b3g-cmyk/sd-webui-forge-neo-auto-vram-purge.git
 
 ## Compatibility
 
-Designed for Forge Neo. Other A1111/Forge forks are not guaranteed to expose the same backend memory-management API. The extension contains best-effort fallbacks for cleanup, but full `Unload GPU Models` behavior requires Forge-compatible model-management functions.
+Designed for Forge Neo. Other A1111/Forge forks are not guaranteed to expose the same backend memory-management API. The extension retains best-effort recovery fallbacks, but full `Unload GPU Models` behavior requires a Forge-compatible `unload_all_models()` implementation.
 
 ## Version
 
-v1.2.2
+v1.2.3
