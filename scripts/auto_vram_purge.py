@@ -23,13 +23,21 @@ DEFAULT_MODE = MODE_UNLOAD_GPU
 VALID_MODES = {MODE_FORGE_DEFAULT, MODE_UNLOAD_GPU}
 LEGACY_FORGE_DEFAULT_MODES = {"OFF", "Cache Only"}
 OPTION_KEY = "forge_neo_auto_vram_purge_mode"
-VERSION = "1.2.3"
+VERSION = "1.2.4"
+
+# Forge Neo's Generate forever loop checks for the next generation every 500 ms.
+# A short grace period keeps models resident across continuous generations while
+# still returning VRAM shortly after a normal one-shot generation becomes idle.
+IDLE_UNLOAD_DELAY_SECONDS = 1.5
 
 _purge_lock = threading.RLock()
+_timer_lock = threading.Lock()
+_pending_timer = None
+_pending_token = 0
 
 
 def _normalize_mode(mode):
-    """Map old saved settings to the v1.2.3 two-mode policy."""
+    """Map old saved settings to the current two-mode policy."""
     if mode in LEGACY_FORGE_DEFAULT_MODES:
         return MODE_FORGE_DEFAULT
     if mode in VALID_MODES:
@@ -155,14 +163,8 @@ def _log_unload_result(elapsed, before, after, collected):
         )
 
 
-def purge_memory(mode):
-    mode = _normalize_mode(mode)
-
-    # Forge Default intentionally does nothing here. Forge Neo already runs
-    # devices.torch_gc() / soft_empty_cache() in its normal generation lifecycle.
-    if mode == MODE_FORGE_DEFAULT:
-        return
-
+def _perform_unload():
+    """Run the actual Forge-managed model unload while the generation queue is idle."""
     with _purge_lock:
         start = time.perf_counter()
         before = _cuda_memory_snapshot()
@@ -173,8 +175,8 @@ def purge_memory(mode):
         unload_all_models = getattr(memory_management, "unload_all_models", None) if memory_management else None
         if callable(unload_all_models):
             try:
-                # Forge's unload_all_models() already routes through free_memory(),
-                # which performs model bookkeeping and cache cleanup when models unload.
+                # Forge's unload_all_models() routes through free_memory(), which
+                # performs model bookkeeping and allocator cleanup when models unload.
                 unload_all_models()
                 unload_ok = True
             except Exception:
@@ -192,6 +194,73 @@ def purge_memory(mode):
 
         after = _cuda_memory_snapshot()
         _log_unload_result(time.perf_counter() - start, before, after, collected)
+
+
+def _cancel_pending_unload():
+    """Invalidate and cancel any delayed unload that has not started yet."""
+    global _pending_timer, _pending_token
+
+    with _timer_lock:
+        _pending_token += 1
+        timer = _pending_timer
+        _pending_timer = None
+
+    if timer is not None:
+        timer.cancel()
+
+
+def _scheduled_unload_worker(token):
+    """Unload only if no newer generation invalidated this timer."""
+    global _pending_timer
+
+    try:
+        # Forge Neo's UI and API share this queue lock. Waiting on it prevents
+        # the timer thread from unloading models during active generation.
+        from modules.call_queue import queue_lock
+
+        with queue_lock:
+            with _timer_lock:
+                if token != _pending_token:
+                    return
+                _pending_timer = None
+
+            # Re-check the setting in case the user changed modes while the
+            # timer was waiting.
+            mode = _normalize_mode(getattr(shared.opts, OPTION_KEY, DEFAULT_MODE))
+            if mode != MODE_UNLOAD_GPU:
+                return
+
+            _perform_unload()
+    except Exception:
+        # Delayed cleanup must never affect generation or server stability.
+        logger.exception("Scheduled Auto VRAM Purge failed")
+
+
+def _schedule_unload():
+    """Schedule one unload after a short idle grace period."""
+    global _pending_timer, _pending_token
+
+    with _timer_lock:
+        old_timer = _pending_timer
+        _pending_token += 1
+        token = _pending_token
+
+        timer = threading.Timer(
+            IDLE_UNLOAD_DELAY_SECONDS,
+            _scheduled_unload_worker,
+            args=(token,),
+        )
+        timer.daemon = True
+        _pending_timer = timer
+
+    if old_timer is not None:
+        old_timer.cancel()
+
+    timer.start()
+    logger.debug(
+        "Auto VRAM Purge scheduled after %.1fs idle grace period",
+        IDLE_UNLOAD_DELAY_SECONDS,
+    )
 
 
 def on_ui_settings():
@@ -213,6 +282,7 @@ def on_ui_settings():
 
 
 script_callbacks.on_ui_settings(on_ui_settings)
+script_callbacks.on_script_unloaded(_cancel_pending_unload)
 logger.info("Forge Neo Auto VRAM Purge v%s loaded", VERSION)
 
 
@@ -226,15 +296,25 @@ class AutoVRAMPurgeScript(scripts.Script):
     def ui(self, is_img2img):
         return []
 
+    def before_process(self, p, *args):
+        # Any new generation invalidates a pending idle unload. This keeps
+        # Generate forever fast because the next job starts before the grace ends.
+        _cancel_pending_unload()
+
     def postprocess(self, p, processed, *args):
-        # ADetailer creates internal img2img jobs. Purging inside those nested jobs
-        # would force unnecessary model reloads before the outer generation finishes.
+        # ADetailer creates internal img2img jobs. Scheduling from those nested
+        # jobs could unload between passes, so only the outer job may schedule.
         if getattr(p, "_ad_inner", False):
             return
 
-        mode = getattr(shared.opts, OPTION_KEY, DEFAULT_MODE)
+        mode = _normalize_mode(getattr(shared.opts, OPTION_KEY, DEFAULT_MODE))
+
+        if mode == MODE_FORGE_DEFAULT:
+            _cancel_pending_unload()
+            return
+
         try:
-            purge_memory(mode)
+            _schedule_unload()
         except Exception:
-            # Cleanup must never turn an otherwise successful generation into a failed job.
-            logger.exception("Auto VRAM Purge failed")
+            # Scheduling must never turn an otherwise successful generation into a failed job.
+            logger.exception("Auto VRAM Purge scheduling failed")
