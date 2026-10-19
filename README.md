@@ -352,3 +352,7 @@ Designed for Forge Neo. Other A1111/Forge forks are not guaranteed to expose the
 ## Version
 
 v1.2.6
+
+## License
+
+The maintainer-authored code, documentation, and project materials are licensed under the [MIT License](LICENSE). See [NOTICE.md](NOTICE.md) for the scope and third-party rights.
