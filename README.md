@@ -3,6 +3,43 @@
 
 A small Forge Neo extension that can automatically unload GPU-resident models after generation to return VRAM to the system.
 
+## v1.2.7 continuous-state fixes
+
+- Each loaded page sends its own ID and increasing notification sequence. A delayed
+  ON cannot replace a newer OFF, and one tab's OFF cannot clear another tab's guard.
+- One idle waiter is retained while protected. After the last active page stops or
+  its 6-second heartbeat TTL expires, the waiter requires 1.5 seconds of true idle
+  before calling Forge's native unload API. Repeated OFF and postprocess calls
+  reuse the pending waiter.
+- Stopped/expired page sequence history is retained for 5 minutes, then reclaimed
+  on a subsequent notification. Sequence rejection applies within that history
+  window; a packet arriving after reclamation can extend protection by at most a
+  fresh TTL, but no longer destroys the unload waiter.
+- The setting name, saved values, default mode, ADetailer exclusions, generation
+  token and Forge queue lock are preserved. Successful native unloads still skip
+  extension-level GC and cache recovery.
+
+Update the Python and JavaScript together, restart Forge Neo, and refresh **all**
+open Forge tabs. Older cached frontends remain compatible through one separate
+legacy guard, but cannot provide per-tab isolation or ordered notifications.
+The existing single Generate forever state per page is unchanged; independent
+loops within the same page are not tracked separately.
+
+### Regression checks
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -v
+node --test tests/test_continuous_guard.cjs
+node --check javascript/continuous_generation_guard.js
+```
+
+These checks execute the product functions with a virtual clock and Forge,
+accelerator, DOM and network stubs. They cover notification reordering, multiple
+senders, TTL expiry, worker coalescing, cancellation, mode changes and native vs.
+fallback cleanup. They do not verify a live Forge server, browser, GPU memory
+release or real multi-tab operation. Earlier performance measurements below are
+historical and have not been repeated for v1.2.7.
+
 ## Recommended default
 
 **`Unload GPU Models` is the default mode.**
@@ -290,7 +327,7 @@ No redundant extension-level full GC or second allocator cleanup is performed af
 On startup:
 
 ```text
-Forge Neo Auto VRAM Purge v1.2.6 loaded
+Forge Neo Auto VRAM Purge v1.2.7 loaded
 ```
 
 When Generate forever is enabled, the console should show once:
@@ -343,7 +380,7 @@ Clone this repository into Forge Neo's `extensions` directory, then restart Forg
 git clone https://github.com/ukr8b3g-cmyk/sd-webui-forge-neo-auto-vram-purge.git
 ```
 
-**Restart Forge Neo after updating to v1.2.6.** The new browser-side JavaScript and backend API endpoint are loaded at startup.
+**Restart Forge Neo and refresh all open Forge tabs after updating.** The browser-side JavaScript and backend API endpoint must be updated together.
 
 ## Compatibility
 
@@ -351,7 +388,7 @@ Designed for Forge Neo. Other A1111/Forge forks are not guaranteed to expose the
 
 ## Version
 
-v1.2.6
+v1.2.7
 
 ## License
 

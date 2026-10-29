@@ -23,7 +23,7 @@ DEFAULT_MODE = MODE_UNLOAD_GPU
 VALID_MODES = {MODE_FORGE_DEFAULT, MODE_UNLOAD_GPU}
 LEGACY_FORGE_DEFAULT_MODES = {"OFF", "Cache Only"}
 OPTION_KEY = "forge_neo_auto_vram_purge_mode"
-VERSION = "1.2.6"
+VERSION = "1.2.7"
 
 # Browser-side Generate Forever detection is authoritative while its heartbeat is
 # alive. If the browser disappears without sending a stop signal, the TTL lets the
@@ -31,13 +31,16 @@ VERSION = "1.2.6"
 IDLE_UNLOAD_DELAY_SECONDS = 1.5
 JOB_STATE_POLL_SECONDS = 0.05
 CONTINUOUS_GUARD_TTL_SECONDS = 6.0
+# Retain stopped/expired clients briefly so delayed packets cannot revive an
+# older state. This is in-memory protocol history, not a saved user setting.
+CONTINUOUS_HISTORY_SECONDS = 300.0
 
 _purge_lock = threading.RLock()
 _worker_lock = threading.Lock()
 _pending_token = 0
 _pending_worker = None
 _continuous_lock = threading.Lock()
-_continuous_guard_until = 0.0
+_continuous_clients = {}
 
 
 def _normalize_mode(mode):
@@ -216,44 +219,54 @@ def _cancel_pending_unload():
 
 def _continuous_generation_active():
     with _continuous_lock:
-        return time.monotonic() < _continuous_guard_until
+        now = time.monotonic()
+        return any(now < state["until"] for state in _continuous_clients.values())
 
 
 def _clear_continuous_generation():
-    global _continuous_guard_until
-
     with _continuous_lock:
-        _continuous_guard_until = 0.0
+        _continuous_clients.clear()
 
 
-def _set_continuous_generation(active):
-    """Update the frontend-reported Generate Forever guard."""
-    global _continuous_guard_until
+def _set_continuous_generation(active, client_id="", sequence=-1):
+    """Apply ordered state for one page; old frontends use a separate legacy slot."""
+    if client_id and (len(client_id) > 128 or sequence < 0):
+        return False
+    if not client_id and sequence != -1:
+        return False
 
     now = time.monotonic()
     with _continuous_lock:
-        was_active = now < _continuous_guard_until
-        if active:
-            _continuous_guard_until = now + CONTINUOUS_GUARD_TTL_SECONDS
-        else:
-            _continuous_guard_until = 0.0
+        expired = [key for key, state in _continuous_clients.items()
+                   if now - state["seen"] > CONTINUOUS_HISTORY_SECONDS
+                   and now >= state["until"]]
+        for key in expired:
+            del _continuous_clients[key]
 
-    # Only invalidate the current worker when Generate Forever first becomes
-    # active. Heartbeats merely extend the guard and do not churn worker tokens.
-    if active and not was_active:
-        _cancel_pending_unload()
+        was_active = any(now < state["until"] for state in _continuous_clients.values())
+        # None cannot collide with a page's string identifier.
+        key = client_id or None
+        previous = _continuous_clients.get(key)
+        if client_id and previous is not None and sequence <= previous["sequence"]:
+            return False
+        _continuous_clients[key] = {
+            "sequence": sequence,
+            "until": now + CONTINUOUS_GUARD_TTL_SECONDS if active else 0.0,
+            "seen": now,
+        }
+        is_active = any(now < state["until"] for state in _continuous_clients.values())
+
+    if is_active and not was_active:
         logger.info("Generate Forever guard active; GPU model unload suspended")
-        return
+    elif was_active and not is_active:
+        logger.info("Generate Forever guard inactive; idle unload resumed")
 
-    if not active:
-        if was_active:
-            logger.info("Generate Forever guard inactive; idle unload resumed")
-
-        # Cancel can happen after the last postprocess worker was superseded by a
-        # heartbeat/new job. Arm a fresh worker so the final VRAM release is not lost.
-        mode = _normalize_mode(getattr(shared.opts, OPTION_KEY, DEFAULT_MODE))
-        if mode == MODE_UNLOAD_GPU:
-            _schedule_unload()
+    # Keep one waiter alive even while protected. It resumes after the last
+    # client's OFF or TTL expiry; ON must never destroy the only recovery path.
+    mode = _normalize_mode(getattr(shared.opts, OPTION_KEY, DEFAULT_MODE))
+    if mode == MODE_UNLOAD_GPU:
+        _schedule_unload()
+    return True
 
 
 def _wait_for_current_job_to_end(token):
@@ -274,6 +287,10 @@ def _wait_idle_grace(token):
 
     while True:
         if not _token_is_current(token):
+            return False
+
+        mode = _normalize_mode(getattr(shared.opts, OPTION_KEY, DEFAULT_MODE))
+        if mode != MODE_UNLOAD_GPU:
             return False
 
         if getattr(shared.state, "job", ""):
@@ -301,31 +318,35 @@ def _scheduled_unload_worker(token):
     global _pending_worker
 
     try:
-        if not _wait_for_current_job_to_end(token):
-            return
-
-        if not _wait_idle_grace(token):
-            return
-
-        # The Web UI and API share this queue lock. If a generation starts at the
-        # grace boundary, wait for it to finish and then reject this stale token.
-        from modules.call_queue import queue_lock
-
-        with queue_lock:
-            if not _token_is_current(token):
+        while _token_is_current(token):
+            if not _wait_for_current_job_to_end(token):
                 return
 
-            if getattr(shared.state, "job", ""):
+            if not _wait_idle_grace(token):
                 return
 
-            if _continuous_generation_active():
-                return
+            # The Web UI and API share this queue lock. If a generation starts at
+            # the grace boundary, its before_process invalidates this token.
+            from modules.call_queue import queue_lock
 
-            mode = _normalize_mode(getattr(shared.opts, OPTION_KEY, DEFAULT_MODE))
-            if mode != MODE_UNLOAD_GPU:
-                return
+            with queue_lock:
+                if not _token_is_current(token):
+                    return
 
-            _perform_unload()
+                if getattr(shared.state, "job", ""):
+                    return
+
+                # A heartbeat may arrive while acquiring queue_lock. Keep the
+                # waiter instead of abandoning the future TTL-expiry unload.
+                if _continuous_generation_active():
+                    continue
+
+                mode = _normalize_mode(getattr(shared.opts, OPTION_KEY, DEFAULT_MODE))
+                if mode != MODE_UNLOAD_GPU:
+                    return
+
+                _perform_unload()
+                return
     except Exception:
         # Delayed cleanup must never affect generation or server stability.
         logger.exception("Scheduled Auto VRAM Purge failed")
@@ -340,6 +361,8 @@ def _schedule_unload():
     global _pending_token, _pending_worker
 
     with _worker_lock:
+        if _pending_worker is not None:
+            return
         _pending_token += 1
         token = _pending_token
 
@@ -351,7 +374,14 @@ def _schedule_unload():
         )
         _pending_worker = worker
 
-    worker.start()
+    try:
+        worker.start()
+    except Exception:
+        # Do not let an unsuccessful start block all future scheduling attempts.
+        with _worker_lock:
+            if _pending_worker is worker:
+                _pending_worker = None
+        raise
     logger.debug(
         "Auto VRAM Purge armed; unload after %.1fs true idle",
         IDLE_UNLOAD_DELAY_SECONDS,
@@ -362,9 +392,11 @@ def _register_api(_, app):
     """Receive the browser-side Generate Forever state/heartbeat."""
 
     @app.post("/forge-neo-auto-vram-purge/continuous", include_in_schema=False)
-    async def forge_neo_auto_vram_purge_continuous(active: bool):
-        _set_continuous_generation(bool(active))
-        return {"ok": True, "active": bool(active)}
+    async def forge_neo_auto_vram_purge_continuous(
+        active: bool, client_id: str = "", sequence: int = -1
+    ):
+        accepted = _set_continuous_generation(bool(active), client_id, sequence)
+        return {"ok": accepted, "active": bool(active)}
 
 
 def on_ui_settings():

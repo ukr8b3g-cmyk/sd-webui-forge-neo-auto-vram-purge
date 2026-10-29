@@ -8,13 +8,23 @@
 
     const endpoint = "/forge-neo-auto-vram-purge/continuous";
     const heartbeatMs = 2000;
+    // A new ID for every loaded page (including duplicated tabs). sessionStorage
+    // can be copied when opening a tab, so it must not identify the sender.
+    const clientId = typeof window.crypto?.randomUUID === "function"
+        ? window.crypto.randomUUID()
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    let sequence = 0;
 
     let continuousActive = false;
     let heartbeatTimer = null;
     let clickListenerInstalled = false;
 
-    function sendState(active, keepalive = false) {
-        const url = `${endpoint}?active=${active ? "true" : "false"}&t=${Date.now()}`;
+    function stateUrl(active) {
+        return `${endpoint}?active=${active ? "true" : "false"}`
+            + `&client_id=${encodeURIComponent(clientId)}&sequence=${++sequence}`;
+    }
+
+    function sendState(active, keepalive = false, url = stateUrl(active)) {
         try {
             fetch(url, {
                 method: "POST",
@@ -88,7 +98,10 @@
         }
 
         try {
-            navigator.sendBeacon(`${endpoint}?active=false`);
+            const url = stateUrl(false);
+            if (!navigator.sendBeacon(url)) {
+                sendState(false, true, url);
+            }
         } catch (_) {
             sendState(false, true);
         }
